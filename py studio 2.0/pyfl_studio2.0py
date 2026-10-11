@@ -1,0 +1,1692 @@
+#!/usr/bin/env python3
+"""
+PyFL Studio - an FL Studio-inspired DAW written in Python.
+
+Install:   pip install PyQt6 numpy scipy sounddevice mido python-rtmidi soundfile
+Run:       python pyfl_studio.py
+
+Features
+  * Channel Rack with step sequencer (synth + sample channels, FL-style pads)
+  * Piano Roll (click = add note, drag = resize/move, right-click = delete)
+  * Built-in synthesizer (sine/saw/square/triangle, ADSR, detune)
+  * Mixer: pan, low-pass filter, drive, reverb send, delay send, master
+  * Drag & drop .wav/.mp3/.flac/.ogg samples and .mid files from the file
+    browser (or your OS) straight into the project
+  * MIDI file import/export, live MIDI keyboard input, typing keyboard as piano
+  * WAV export, project save/load (.pyfl)
+Shortcuts: Space = play/pause, Z-M / Q-P rows = piano keys
+"""
+import sys, os, json, math, threading, traceback, subprocess, tempfile, time
+import numpy as np
+from scipy.signal import lfilter
+from scipy.io import wavfile
+
+try:
+    import sounddevice as sd
+except Exception:
+    sd = None
+try:
+    import mido
+except Exception:
+    mido = None
+try:
+    import soundfile as sf
+except Exception:
+    sf = None
+
+SR, BLOCK = 44100, 512
+ROOT, P_LO, P_HI, MAX_LEN = 60, 24, 108, 512
+AUDIO_EXT = (".wav", ".mp3", ".flac", ".ogg", ".aif", ".aiff")
+MIDI_EXT = (".mid", ".midi")
+PALETTE = ["#ff6b4a", "#ffb13b", "#9ed84b", "#4bd1c5", "#5aa9ff", "#b57bff", "#ff74b8", "#e6e66a"]
+
+
+# ============================================================ AUDIO / MODEL
+def load_sample(path):
+    # libsndfile supports WAV/FLAC and many MP3 builds; ffmpeg is the reliable fallback.
+    if sf is not None:
+        try:
+            data, sr = sf.read(path, always_2d=True, dtype="float32")
+        except Exception:
+            data = None
+    else:
+        data = None
+    if data is None and path.lower().endswith((".mp3", ".flac", ".ogg", ".aif", ".aiff")):
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                converted = tmp.name
+            subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", path, "-ar", str(SR), "-ac", "2", converted], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            sr, data = wavfile.read(converted)
+            os.unlink(converted)
+        except Exception as ex:
+            try:
+                if 'converted' in locals() and os.path.exists(converted): os.unlink(converted)
+            except Exception: pass
+            raise RuntimeError("Could not decode this audio file. Install ffmpeg (sudo apt install ffmpeg). " + str(ex))
+    elif data is None:
+        sr, data = wavfile.read(path)
+        if data.dtype.kind == "i":
+            data = data / float(np.iinfo(data.dtype).max)
+        elif data.dtype.kind == "u":
+            data = (data.astype(np.float32) - 128.0) / 128.0
+        data = data.astype(np.float32)
+        if data.ndim == 1:
+            data = data[:, None]
+    data = data.T
+    if data.shape[0] == 1:
+        data = np.vstack([data, data])
+    data = data[:2]
+    if sr != SR:
+        n = max(2, int(data.shape[1] * SR / sr))
+        x = np.linspace(0, data.shape[1] - 1, n)
+        data = np.stack([np.interp(x, np.arange(data.shape[1]), c) for c in data])
+    return np.ascontiguousarray(data, dtype=np.float32)
+
+
+_DRUMS = {}
+
+
+def make_drums():
+    if _DRUMS:
+        return _DRUMS
+    rng = np.random.default_rng(1)
+    T = lambda d: np.arange(int(d * SR)) / SR
+    fin = lambda a: np.vstack([a, a]).astype(np.float32) * (0.9 / max(1e-6, np.abs(a).max()))
+    x = T(0.45)
+    ph = 2 * np.pi * np.cumsum(45 + 130 * np.exp(-x * 28)) / SR
+    _DRUMS["kick"] = fin(np.sin(ph) * np.exp(-x * 7))
+    x = T(0.25)
+    _DRUMS["snare"] = fin(rng.standard_normal(len(x)) * np.exp(-x * 22) * 0.6 + np.sin(2 * np.pi * 185 * x) * np.exp(-x * 28) * 0.5)
+    x = T(0.09)
+    _DRUMS["hat"] = fin(np.diff(rng.standard_normal(len(x)), prepend=0) * np.exp(-x * 70))
+    x = T(0.3)
+    env = np.exp(-x * 14) * 0.6
+    for k in (0.0, 0.011, 0.022):
+        env += np.where(x >= k, np.exp(-np.clip(x - k, 0, None) * 70), 0)
+    _DRUMS["clap"] = fin(np.diff(rng.standard_normal(len(x)), prepend=0) * env)
+    return _DRUMS
+
+
+class Channel:
+    PARAMS = ["name", "kind", "path", "builtin", "color", "wave", "a", "d", "s", "r", "detune",
+              "vol", "pan", "cut", "drive", "rev", "dly", "mute", "instrument", "vowel", "slur"]
+    WAVES = ["Sine", "Saw", "Square", "Triangle"]
+
+    def __init__(self, name, kind="synth", sample=None, path=None, color=None):
+        self.name, self.kind, self.sample, self.path, self.builtin = name, kind, sample, path, None
+        self.color = color or PALETTE[0]
+        self.notes = []  # [start_step, length_steps, midi_pitch, velocity]
+        self.wave, self.a, self.d, self.s, self.r, self.detune = 1, 0.01, 0.25, 0.55, 0.2, 10.0
+        self.instrument, self.vowel, self.slur = "Synth", "Ah", False
+        self.vol, self.pan, self.cut, self.drive, self.rev, self.dly, self.mute = 0.8, 0.0, 1.0, 0.0, 0.0, 0.0, False
+        self.zi = np.zeros((2, 1))
+
+    def to_dict(self):
+        d = {k: getattr(self, k) for k in self.PARAMS}
+        d["notes"] = self.notes
+        return d
+
+    @staticmethod
+    def from_dict(d):
+        ch = Channel(d.get("name", "Channel"), d.get("kind", "synth"))
+        for k in Channel.PARAMS:
+            if k in d:
+                setattr(ch, k, d[k])
+        ch.notes = [list(n) for n in d.get("notes", [])]
+        if ch.kind == "sample":
+            if ch.builtin and ch.builtin in make_drums():
+                ch.sample = make_drums()[ch.builtin]
+            elif ch.path and os.path.exists(ch.path):
+                ch.sample = load_sample(ch.path)
+        return ch
+
+
+class Project:
+    def __init__(self):
+        self.channels, self.bpm, self.length, self.master = [], 130.0, 32, 0.8
+
+    def next_color(self):
+        return PALETTE[len(self.channels) % len(PALETTE)]
+
+    def add_synth(self, name=None):
+        ch = Channel(name or f"Synth {len(self.channels) + 1}", "synth", color=self.next_color())
+        self.channels.append(ch)
+        return ch
+
+    def add_sample(self, path):
+        ch = Channel(os.path.splitext(os.path.basename(path))[0][:14], "sample", load_sample(path), path, self.next_color())
+        self.channels.append(ch)
+        return ch
+
+    def to_json(self):
+        return {"bpm": self.bpm, "length": self.length, "master": self.master,
+                "channels": [c.to_dict() for c in self.channels]}
+
+    def load_json(self, d):
+        self.bpm, self.length, self.master = d.get("bpm", 130), d.get("length", 32), d.get("master", 0.8)
+        self.channels = [Channel.from_dict(c) for c in d.get("channels", [])]
+
+
+def default_project(p):
+    dr = make_drums()
+    for nm, key, vol, rev in [("Kick", "kick", 0.9, 0.0), ("Clap", "clap", 0.6, 0.25),
+                              ("Hat", "hat", 0.45, 0.05), ("Snare", "snare", 0.7, 0.15)]:
+        c = Channel(nm, "sample", dr[key], color=p.next_color())
+        c.builtin, c.vol, c.rev = key, vol, rev
+        p.channels.append(c)
+    N = lambda st, ln, pi, ve=0.9: [float(st), float(ln), pi, ve]
+    p.channels[0].notes = [N(i, 1, ROOT) for i in range(0, 32, 4)]
+    p.channels[1].notes = [N(i, 1, ROOT) for i in range(4, 32, 8)]
+    p.channels[2].notes = [N(i, 1, ROOT, 0.6) for i in range(2, 32, 4)]
+    p.channels[3].notes = [N(i, 1, ROOT, 0.5) for i in (7, 15, 23, 31)]
+    bass = p.add_synth("Bass")
+    bass.cut, bass.r, bass.vol, bass.detune = 0.55, 0.1, 0.85, 6.0
+    bass.notes = [N(s, l, pi) for s, l, pi in [(0, 2, 45), (3, 1, 45), (4, 2, 45), (7, 1, 48), (8, 2, 43), (11, 1, 43),
+                                              (12, 2, 43), (14, 2, 48), (16, 2, 41), (19, 1, 41), (20, 2, 41), (23, 1, 45),
+                                              (24, 2, 43), (27, 1, 43), (28, 2, 43), (30, 2, 50)]]
+    lead = p.add_synth("Lead")
+    lead.wave, lead.cut, lead.rev, lead.dly, lead.vol, lead.d, lead.s = 2, 0.8, 0.35, 0.3, 0.5, 0.15, 0.3
+    lead.notes = [N(s, 1, pi, 0.8) for s, pi in zip(range(0, 32, 2), [69, 72, 76, 72, 67, 71, 74, 71, 65, 69, 72, 69, 67, 71, 74, 79])]
+
+
+def import_midi(path, project):
+    mid = mido.MidiFile(path)
+    spt = 4.0 / mid.ticks_per_beat
+    bpm, found, maxend = None, [], 0.0
+    for ti, tr in enumerate(mid.tracks):
+        t, on, notes, name = 0, {}, [], None
+        for m in tr:
+            t += m.time
+            if m.is_meta:
+                if m.type == "set_tempo" and bpm is None:
+                    bpm = mido.tempo2bpm(m.tempo)
+                elif m.type == "track_name" and not name:
+                    name = m.name
+            elif m.channel == 9:
+                continue  # GM drums are skipped (they'd sound wrong on a synth)
+            elif m.type == "note_on" and m.velocity > 0:
+                on.setdefault((m.channel, m.note), []).append((t, m.velocity))
+            elif m.type in ("note_off", "note_on"):
+                lst = on.get((m.channel, m.note))
+                if lst:
+                    s, v = lst.pop(0)
+                    notes.append([s * spt, max(0.25, (t - s) * spt), m.note, v / 127.0])
+        if notes:
+            found.append((name or f"Track {ti}", notes))
+            maxend = max(maxend, max(n[0] + n[1] for n in notes))
+    if bpm:
+        project.bpm = round(bpm, 2)
+    project.length = int(min(MAX_LEN, max(16, math.ceil(maxend / 16) * 16)))
+    for name, notes in found[:16]:
+        ch = project.add_synth(name[:14])
+        ch.vol, ch.cut, ch.rev = 0.55, 0.75, 0.1
+        ch.notes = [n for n in notes if n[0] < project.length]
+    return len(found)
+
+
+def export_midi(path, project):
+    mid = mido.MidiFile(ticks_per_beat=480)
+    meta = mido.MidiTrack()
+    meta.append(mido.MetaMessage("set_tempo", tempo=mido.bpm2tempo(project.bpm)))
+    mid.tracks.append(meta)
+    for i, ch in enumerate(project.channels):
+        if not ch.notes:
+            continue
+        tr = mido.MidiTrack()
+        tr.append(mido.MetaMessage("track_name", name=ch.name))
+        ev = []
+        for note in ch.notes:
+            st, ln, pi, ve = note[:4]
+            pi = int(min(127, max(0, pi)))
+            ev.append((int(st * 120), 1, pi, ve))
+            ev.append((int((st + ln) * 120), 0, pi, ve))
+        ev.sort(key=lambda e: (e[0], e[1]))
+        last = 0
+        for t, on, pi, ve in ev:
+            tr.append(mido.Message("note_on" if on else "note_off", note=pi, channel=i % 9,
+                                   velocity=max(1, int(ve * 127)) if on else 0, time=t - last))
+            last = t
+        mid.tracks.append(tr)
+    mid.save(path)
+
+
+class Ring:
+    def __init__(self, d):
+        self.d, self.buf, self.i = d, np.zeros(d), 0
+
+    def idx(self, n):
+        ix = (self.i + np.arange(n)) % self.d
+        self.i = (self.i + n) % self.d
+        return ix
+
+
+class Voice:
+    def __init__(self, ch, pitch, vel, delay=0, hold=float("inf"), vowel=None, slide_to=None, slide_duration=None):
+        self.ch, self.pitch, self.vel, self.age, self.hold, self.dead = ch, pitch, vel, -int(delay), hold, False
+        self.vowel, self.slide_to = vowel, slide_to
+        self.slide_duration = max(1.0, float(slide_duration)) if slide_duration is not None else None
+
+
+def _osc(w, ph):
+    if w == 0:
+        return np.sin(2 * np.pi * ph)
+    if w == 1:
+        return 2 * ph - 1
+    if w == 2:
+        return np.where(ph < 0.5, 1.0, -1.0)
+    return 4 * np.abs(ph - 0.5) - 1
+
+
+class Engine:
+    def __init__(self, project):
+        self.p, self.playing, self.pos, self.voices, self.peak = project, False, 0, [], 0.0
+        self.lock = threading.Lock()
+        self.combs = [(Ring(d), 0.84) for d in (1557, 1617, 1491, 1422)]
+        self.aps = [Ring(1051), Ring(773)]
+        self.echo = Ring(20000)
+
+    # ---- control (GUI thread)
+    def note_on(self, ch, pitch, vel=0.9, hold=float("inf")):
+        with self.lock:
+            self.voices.append(Voice(ch, pitch, vel, 0, hold))
+
+    def note_off(self, ch, pitch):
+        with self.lock:
+            for v in self.voices:
+                if v.ch is ch and v.pitch == pitch and v.hold == float("inf"):
+                    v.hold = max(v.age, 0)
+
+    def stop(self, reset=True):
+        with self.lock:
+            self.playing = False
+            if reset:
+                self.pos = 0
+            keep = []
+            for v in self.voices:
+                if v.ch.kind == "synth" and v.age >= 0:
+                    v.hold = min(v.hold, v.age)
+                    keep.append(v)
+            self.voices = keep
+
+    # ---- DSP (audio thread)
+    def _schedule(self, pos, m, off, ss):
+        for ch in self.p.channels:
+            if ch.mute:
+                continue
+            for note in ch.notes:
+                st, ln, pi, ve = note[:4]
+                s = int(st * ss)
+                if pos <= s < pos + m:
+                    slide_to = note[5] if len(note) > 5 else None
+                    target_step = note[6] if len(note) > 6 and note[6] is not None else None
+                    vowel = note[4] if len(note) > 4 else ch.vowel
+                    # A slur spans the horizontal distance from this note's start
+                    # to the destination note's start, rather than a fixed short bend.
+                    distance_steps = max(float(ln), float(target_step) - float(st)) if slide_to is not None and target_step is not None else float(ln)
+                    duration_samples = max(1.0, distance_steps * ss)
+                    hold_samples = max(float(ln * ss), duration_samples) if slide_to is not None else ln * ss
+                    self.voices.append(Voice(ch, pi, ve, off + s - pos, hold_samples, vowel, slide_to, duration_samples if slide_to is not None else None))
+
+    def _synth(self, v, buf, n):
+        ch = v.ch
+        tt0 = v.age + np.arange(n, dtype=np.float64)
+        live, tt = tt0 >= 0, np.maximum(tt0, 0)
+        A, D, S, R = max(ch.a, 0.002) * SR, max(ch.d, 0.002) * SR, ch.s, max(ch.r, 0.01) * SR
+        held = lambda x: np.where(x < A, x / A, np.where(x < A + D, 1 - (1 - S) * (x - A) / D, S))
+        e = held(tt)
+        if v.hold != float("inf"):
+            lvl = float(held(np.array([float(v.hold)]))[0])
+            e = np.where(tt < v.hold, e, lvl * np.clip(1 - (tt - v.hold) / R, 0, 1))
+            if v.age + n >= v.hold + R:
+                v.dead = True
+        f = 440.0 * 2 ** ((v.pitch - 69) / 12)
+        phase_cycles = f * tt / SR
+        if v.slide_to is not None and v.slide_duration is not None:
+            try:
+                # Continuous exponential-frequency glide, linear in semitones.
+                # It starts with the note and lasts for the source-to-target spacing.
+                target_pitch = float(v.slide_to)
+                delta = target_pitch - float(v.pitch)
+                duration = max(1.0, float(v.slide_duration))
+                ramp_t = np.minimum(tt, duration)
+                k = math.log(2.0) * delta / (12.0 * duration)
+                if abs(k) < 1e-12:
+                    ramp_cycles = f * ramp_t / SR
+                else:
+                    ramp_cycles = f * np.expm1(k * ramp_t) / (k * SR)
+                target_f = 440.0 * 2 ** ((target_pitch - 69) / 12)
+                phase_cycles = np.where(tt <= duration, ramp_cycles,
+                                        ramp_cycles + target_f * (tt - duration) / SR)
+            except (TypeError, ValueError, OverflowError):
+                pass
+        phase = phase_cycles % 1.0
+        # Procedural presets: lightweight, offline instruments (not sampled orchestral libraries).
+        if ch.instrument == "Piano":
+            sig = sum((1.0 / h**1.45) * np.sin(2*np.pi*phase*h + 0.13*h) for h in range(1, 8))
+            e *= np.exp(-tt / (SR * 1.5)) * 1.7
+        elif ch.instrument == "Guitar":
+            sig = sum((1.0 / h) * np.sin(2*np.pi*phase*h + 0.2*np.sin(tt/SR*5)) for h in range(1, 6))
+            e *= np.exp(-tt / (SR * 2.2)) * 1.2
+        elif ch.instrument == "Violin":
+            sig = 0.65*_osc(1, phase) + 0.25*np.sin(4*np.pi*phase) + 0.1*np.sin(6*np.pi*phase)
+            sig *= (0.85 + 0.15*np.sin(2*np.pi*5.2*tt/SR))
+        elif ch.instrument == "Choir":
+            # Vowel-like formant peaks over a harmonic source; selectable vowel changes resonances.
+            vowel = v.vowel or ch.vowel
+            formants = {"Ah": (800, 1200, 2800), "Ee": (300, 2300, 3000), "Oh": (500, 900, 2600), "Oo": (350, 800, 2200), "Eh": (550, 1700, 2600)}.get(vowel, (800,1200,2800))
+            sig = np.zeros_like(tt)
+            for h in range(1, 25):
+                freq = f*h
+                weight = sum(np.exp(-0.5*((freq-F)/180)**2) for F in formants) / (h**0.65)
+                sig += weight*np.sin(2*np.pi*phase*h)
+            sig = np.tanh(sig * 1.5)
+        elif ch.instrument == "Flute":
+            sig = np.sin(2*np.pi*phase) + 0.22*np.sin(4*np.pi*phase) + 0.06*np.sin(6*np.pi*phase)
+        elif ch.instrument == "Organ":
+            sig = sum(np.sin(2*np.pi*phase*h) for h in (1,2,3,4)) * 0.25
+        else:
+            sig = _osc(ch.wave, phase)
+            if ch.detune > 0.01:
+                sig = (sig + _osc(ch.wave, (f * 2 ** (ch.detune / 1200) * tt / SR) % 1.0)) * 0.5
+        sig = sig * e * live * v.vel * 0.4
+        buf[0] += sig
+        buf[1] += sig
+
+    def _sample(self, v, buf, n):
+        d = v.ch.sample
+        if d is None:
+            v.dead = True
+            return
+        rate = 2.0 ** ((v.pitch - ROOT) / 12)
+        idx = (v.age + np.arange(n, dtype=np.float64)) * rate
+        N = d.shape[1]
+        ok = (idx >= 0) & (idx < N - 1)
+        if ok.any():
+            i = idx[ok]
+            i0 = i.astype(np.int64)
+            fr = (i - i0).astype(np.float32)
+            buf[:, ok] += (d[:, i0] * (1 - fr) + d[:, i0 + 1] * fr) * v.vel
+        if (v.age + n) * rate >= N - 1:
+            v.dead = True
+
+    def _reverb(self, x):
+        n, y = len(x), np.zeros(len(x))
+        for r, g in self.combs:
+            ix = r.idx(n)
+            d = r.buf[ix]
+            r.buf[ix] = x + g * d
+            y += d
+        y *= 0.12
+        for r in self.aps:
+            ix = r.idx(n)
+            d = r.buf[ix]
+            w = y + 0.5 * d
+            r.buf[ix] = w
+            y = -0.5 * w + d
+        return y
+
+    def _echo(self, x):
+        d = max(BLOCK + 1, int(60.0 / self.p.bpm * 0.75 * SR))
+        if d != self.echo.d:
+            self.echo = Ring(d)
+        ix = self.echo.idx(len(x))
+        y = self.echo.buf[ix]
+        self.echo.buf[ix] = x + 0.45 * y
+        return y
+
+    def render(self, n):
+        p = self.p
+        ss = 60.0 / p.bpm / 4 * SR
+        loop = int(p.length * ss)
+        bufs = {}
+        with self.lock:
+            if self.playing:
+                if self.pos >= loop:
+                    self.pos = 0
+                pos, off, left = self.pos, 0, n
+                while left > 0:
+                    m = min(left, loop - pos)
+                    self._schedule(pos, m, off, ss)
+                    pos, off, left = pos + m, off + m, left - m
+                    if pos >= loop:
+                        pos = 0
+                self.pos = pos
+            live = []
+            for v in self.voices:
+                buf = bufs.get(v.ch)
+                if buf is None:
+                    buf = bufs[v.ch] = np.zeros((2, n))
+                (self._synth if v.ch.kind == "synth" else self._sample)(v, buf, n)
+                v.age += n
+                if not v.dead:
+                    live.append(v)
+            self.voices = live
+        out, rev_in, dly_in = np.zeros((2, n)), np.zeros(n), np.zeros(n)
+        for ch, buf in bufs.items():
+            if ch.mute:
+                continue
+            if ch.cut < 0.995:
+                a = 1 - math.exp(-2 * math.pi * 20.0 * 1000.0 ** ch.cut / SR)
+                buf, ch.zi = lfilter([a], [1, -(1 - a)], buf, axis=1, zi=ch.zi)
+            if ch.drive > 0.01:
+                g = 1 + ch.drive * 25
+                buf = np.tanh(buf * g) / math.tanh(g)
+            ang = (ch.pan + 1) * math.pi / 4
+            g = ch.vol ** 2 * 1.414
+            buf = buf * np.array([[math.cos(ang) * g], [math.sin(ang) * g]])
+            mono = (buf[0] + buf[1]) * 0.5
+            rev_in += mono * ch.rev
+            dly_in += mono * ch.dly
+            out += buf
+        out += self._reverb(rev_in) + self._echo(dly_in)
+        out *= p.master
+        np.tanh(out, out)
+        self.peak = max(float(np.abs(out).max()), self.peak * 0.9)
+        return out
+
+    def render_offline(self):
+        """Render one loop plus a reverb/release tail (call with audio stopped)."""
+        self.voices, self.pos, self.playing = [], 0, True
+        ss = 60.0 / self.p.bpm / 4 * SR
+        total, chunks = int(self.p.length * ss), []
+        done = 0
+        while done < total:
+            m = min(BLOCK, total - done)
+            chunks.append(self.render(m))
+            done += m
+        self.playing = False
+        for _ in range(int(2.5 * SR / BLOCK)):
+            chunks.append(self.render(BLOCK))
+        return np.concatenate(chunks, axis=1)
+
+
+class Audio:
+    def __init__(self, engine):
+        self.eng, self.stream = engine, None
+        if sd is None:
+            print("sounddevice not available - no audio output.")
+            return
+        try:
+            self.stream = sd.OutputStream(samplerate=SR, channels=2, blocksize=BLOCK, dtype="float32", callback=self.cb)
+            self.stream.start()
+        except Exception as e:
+            print("Could not open audio device:", e)
+
+    def cb(self, outdata, frames, t, status):
+        try:
+            pos = 0
+            while pos < frames:
+                m = min(BLOCK, frames - pos)
+                outdata[pos:pos + m] = self.eng.render(m).T
+                pos += m
+        except Exception:
+            outdata.fill(0)
+            traceback.print_exc()
+
+    def close(self):
+        if self.stream:
+            self.stream.stop()
+            self.stream.close()
+
+
+# ==== GUI ====
+from PyQt6 import QtCore, QtGui, QtWidgets
+from PyQt6.QtCore import Qt, QRectF, QPointF, QRect, QTimer, pyqtSignal
+from PyQt6.QtGui import QColor, QPainter, QPen, QPainterPath
+
+BG, PANEL, DARK, ACC, TXT, DIM = "#2b3238", "#37414a", "#1f262b", "#ff9a2e", "#d5dde2", "#8a98a3"
+
+QSS = f"""
+* {{ color:{TXT}; font-family:'Segoe UI','Helvetica Neue',Arial; font-size:12px; }}
+QMainWindow, QDialog {{ background:{BG}; }}
+QWidget#strip {{ background:{PANEL}; border:1px solid {DARK}; border-radius:6px; }}
+QMenuBar {{ background:{DARK}; }} QMenuBar::item:selected {{ background:{ACC}; color:#111; }}
+QMenu {{ background:{PANEL}; border:1px solid {DARK}; }} QMenu::item:selected {{ background:{ACC}; color:#111; }}
+QToolBar {{ background:{PANEL}; border:none; border-bottom:2px solid {DARK}; spacing:8px; padding:5px; }}
+QDockWidget {{ titlebar-close-icon:none; }}
+QDockWidget::title {{ background:{DARK}; padding:5px 8px; color:{ACC}; font-weight:bold; }}
+QPushButton {{ background:#47525b; border:1px solid {DARK}; border-radius:4px; padding:4px 10px; }}
+QPushButton:hover {{ background:#56626c; }} QPushButton:checked {{ background:{ACC}; color:#111; }}
+QPushButton#play {{ font-size:18px; min-width:40px; color:#7be07b; }}
+QPushButton#play:checked {{ background:#3f8f3f; color:white; }}
+QPushButton#stop {{ font-size:18px; min-width:40px; color:#ff7b6b; }}
+QPushButton#led {{ min-width:14px; max-width:14px; min-height:14px; max-height:14px; padding:0; border-radius:7px; background:#2c3a2c; }}
+QPushButton#led:checked {{ background:#6bff6b; }}
+QDoubleSpinBox, QComboBox {{ background:{DARK}; border:1px solid #11161a; border-radius:4px; padding:3px 6px; }}
+QDoubleSpinBox#bpm {{ color:{ACC}; font:bold 20px 'Consolas','Courier New',monospace; min-width:105px; }}
+QLabel#time {{ color:{ACC}; background:{DARK}; border-radius:4px; padding:3px 10px; font:bold 20px 'Consolas','Courier New',monospace; }}
+QTreeView {{ background:{DARK}; border:none; }} QTreeView::item:selected {{ background:{ACC}; color:#111; }}
+QScrollArea {{ border:none; background:{BG}; }}
+QScrollBar:vertical {{ background:{DARK}; width:12px; }} QScrollBar:horizontal {{ background:{DARK}; height:12px; }}
+QScrollBar::handle {{ background:#58646e; border-radius:5px; min-height:24px; min-width:24px; }}
+QScrollBar::add-line, QScrollBar::sub-line {{ width:0; height:0; }}
+QSlider::groove:vertical {{ background:{DARK}; width:8px; border-radius:4px; }}
+QSlider::sub-page:vertical {{ background:{ACC}; border-radius:4px; }}
+QSlider::handle:vertical {{ background:#dfe5e8; height:14px; margin:0 -6px; border-radius:3px; }}
+QProgressBar {{ background:{DARK}; border:none; border-radius:3px; max-height:8px; }}
+QProgressBar::chunk {{ background:qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #6bff6b,stop:0.75 #ffd23f,stop:1 #ff5b4a); }}
+QToolTip {{ background:{DARK}; border:1px solid {ACC}; }}
+"""
+
+
+def clear(layout):
+    while layout.count():
+        it = layout.takeAt(0)
+        if it.widget():
+            it.widget().deleteLater()
+        elif it.layout():
+            clear(it.layout())
+
+
+class Knob(QtWidgets.QWidget):
+    changed = pyqtSignal(float)
+
+    def __init__(self, name, value=0.0, lo=0.0, hi=1.0, color=ACC, size=34, show=True):
+        super().__init__()
+        self.name, self.lo, self.hi, self.v, self.default, self.show = name, lo, hi, value, value, show
+        self.color = QColor(color)
+        self.setFixedSize(size, size + (13 if show else 0))
+        self._drag = None
+        self._tip()
+
+    def _tip(self):
+        self.setToolTip(f"{self.name}: {self.v:.2f}")
+
+    def setValue(self, v):
+        self.v = min(max(v, self.lo), self.hi)
+        self._tip()
+        self.update()
+
+    def _set(self, v):
+        self.setValue(v)
+        self.changed.emit(self.v)
+
+    def mousePressEvent(self, e):
+        self._drag = (e.position().y(), self.v)
+
+    def mouseMoveEvent(self, e):
+        if self._drag:
+            self._set(self._drag[1] + (self._drag[0] - e.position().y()) / 140.0 * (self.hi - self.lo))
+
+    def mouseReleaseEvent(self, e):
+        self._drag = None
+
+    def mouseDoubleClickEvent(self, e):
+        self._set(self.default)
+
+    def wheelEvent(self, e):
+        self._set(self.v + (1 if e.angleDelta().y() > 0 else -1) * (self.hi - self.lo) / 40)
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        s = self.width()
+        r = QRectF(4, 4, s - 8, s - 8)
+        frac = (self.v - self.lo) / (self.hi - self.lo)
+        p.setBrush(QColor("#2a3238"))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(r.adjusted(3, 3, -3, -3))
+        p.setPen(QPen(QColor("#151a1e"), 3, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        p.drawArc(r, 225 * 16, -270 * 16)
+        p.setPen(QPen(self.color, 3, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        p.drawArc(r, 225 * 16, int(-270 * 16 * frac))
+        ang, c = math.radians(225 - 270 * frac), r.center()
+        p.setPen(QPen(QColor("#ffffff"), 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        p.drawLine(c, QPointF(c.x() + math.cos(ang) * (s / 2 - 9), c.y() - math.sin(ang) * (s / 2 - 9)))
+        if self.show:
+            p.setPen(QColor(DIM))
+            p.drawText(QRectF(0, s, s, 13), Qt.AlignmentFlag.AlignCenter, self.name)
+
+
+class StepRow(QtWidgets.QWidget):
+    CW, CH = 24, 30
+
+    def __init__(self, main, ch):
+        super().__init__()
+        self.main, self.ch, self.play, self.state = main, ch, -1, None
+        self.setFixedHeight(self.CH + 2)
+        self.fit()
+
+    def fit(self):
+        self.setFixedWidth(self.main.project.length * self.CW + 2)
+
+    def starts(self):
+        return {int(n[0]) for n in self.ch.notes}
+
+    def set_play(self, i):
+        if i != self.play:
+            self.play = i
+            self.update()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        on, col = self.starts(), QColor(self.ch.color)
+        p.setPen(Qt.PenStyle.NoPen)
+        for i in range(self.main.project.length):
+            r = QRectF(2 + i * self.CW, 1, self.CW - 2, self.CH)
+            p.setBrush(col if i in on else QColor("#56616a" if (i // 4) % 2 else "#46505a"))
+            p.drawRoundedRect(r, 3, 3)
+            if i in on:
+                p.setBrush(QColor(255, 255, 255, 45))
+                p.drawRoundedRect(QRectF(r.x(), r.y(), r.width(), r.height() / 2), 3, 3)
+            if i == self.play:
+                p.setBrush(QColor(255, 255, 255, 90))
+                p.drawRoundedRect(r, 3, 3)
+
+    def cell(self, e):
+        return int((e.position().x() - 2) // self.CW)
+
+    def mousePressEvent(self, e):
+        i = self.cell(e)
+        if not 0 <= i < self.main.project.length:
+            return
+        self.main.select_channel(self.ch)
+        self.state = (i not in self.starts()) and e.button() != Qt.MouseButton.RightButton
+        self.apply(i)
+
+    def mouseMoveEvent(self, e):
+        i = self.cell(e)
+        if self.state is not None and 0 <= i < self.main.project.length:
+            self.apply(i)
+
+    def mouseReleaseEvent(self, e):
+        self.state = None
+
+    def apply(self, i):
+        ch, has = self.ch, i in self.starts()
+        if self.state and not has:
+            ch.notes.append([float(i), 1.0, ROOT, 0.9])
+            self.main.engine.note_on(ch, ROOT, 0.9, hold=int(0.25 * SR))
+        elif not self.state and has:
+            ch.notes[:] = [n for n in ch.notes if int(n[0]) != i]
+        else:
+            return
+        self.update()
+        self.main.roll.update()
+
+
+class ChannelRow(QtWidgets.QWidget):
+    def __init__(self, main, ch):
+        super().__init__()
+        self.main, self.ch = main, ch
+        lay = QtWidgets.QHBoxLayout(self)
+        lay.setContentsMargins(4, 2, 4, 2)
+        lay.setSpacing(6)
+        self.led = QtWidgets.QPushButton()
+        self.led.setObjectName("led")
+        self.led.setCheckable(True)
+        self.led.setChecked(not ch.mute)
+        self.led.toggled.connect(lambda on: (setattr(ch, "mute", not on), main.sync(ch)))
+        self.pank = Knob("Pan", ch.pan, -1, 1, size=28, show=False)
+        self.volk = Knob("Volume", ch.vol, 0, 1, size=28, show=False)
+        self.pank.changed.connect(lambda v: (setattr(ch, "pan", v), main.sync(ch)))
+        self.volk.changed.connect(lambda v: (setattr(ch, "vol", v), main.sync(ch)))
+        self.btn = QtWidgets.QPushButton(ch.name)
+        self.btn.setCheckable(True)
+        self.btn.setFixedSize(112, 30)
+        self.btn.setStyleSheet(f"QPushButton{{text-align:left;padding-left:8px;border-left:6px solid {ch.color};background:#4a555f;}}"
+                               f"QPushButton:checked{{background:#6a7782;color:white;}}")
+        self.btn.clicked.connect(lambda: main.select_channel(ch))
+        self.btn.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.btn.customContextMenuRequested.connect(self.menu)
+        self.steps = StepRow(main, ch)
+        for w in (self.led, self.pank, self.volk, self.btn, self.steps):
+            lay.addWidget(w)
+        lay.addStretch()
+
+    def menu(self, pos):
+        m = QtWidgets.QMenu(self)
+        a_ren, a_clr, a_del = m.addAction("Rename..."), m.addAction("Clear pattern"), m.addAction("Delete channel")
+        act = m.exec(self.btn.mapToGlobal(pos))
+        if act == a_ren:
+            t, ok = QtWidgets.QInputDialog.getText(self, "Rename", "Name:", text=self.ch.name)
+            if ok and t:
+                self.ch.name = t[:14]
+                self.main.refresh_all()
+        elif act == a_clr:
+            self.ch.notes.clear()
+            self.main.roll.update()
+            self.steps.update()
+        elif act == a_del:
+            self.main.project.channels.remove(self.ch)
+            self.main.refresh_all()
+
+
+class Rack(QtWidgets.QWidget):
+    def __init__(self, main):
+        super().__init__()
+        self.main, self.rows = main, []
+        v = QtWidgets.QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        self.inner = QtWidgets.QWidget()
+        self.col = QtWidgets.QVBoxLayout(self.inner)
+        self.col.setContentsMargins(4, 4, 4, 4)
+        self.col.setSpacing(2)
+        self.scroll = QtWidgets.QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setWidget(self.inner)
+        v.addWidget(self.scroll)
+
+    def rebuild(self):
+        clear(self.col)
+        self.rows = []
+        for ch in self.main.project.channels:
+            r = ChannelRow(self.main, ch)
+            self.rows.append(r)
+            self.col.addWidget(r)
+        add = QtWidgets.QPushButton("+  Add channel")
+        menu = QtWidgets.QMenu(add)
+        for instrument in ("Synth", "Piano", "Guitar", "Violin", "Choir", "Flute", "Organ", "Bass", "Lead", "Pad"):
+            menu.addAction(instrument, lambda checked=False, inst=instrument: self.main.add_instrument(inst))
+        menu.addAction("Audio file...", self.main.add_sample_dialog)
+        menu.addAction("Record hum notes...", self.main.record_hum_notes)
+        add.setMenu(menu)
+        self.col.addWidget(add, alignment=Qt.AlignmentFlag.AlignLeft)
+        self.col.addStretch()
+
+    def refresh_steps(self):
+        for r in self.rows:
+            r.steps.update()
+
+
+class PianoRoll(QtWidgets.QWidget):
+    CW, RH, KW = 26, 14, 58
+
+    def __init__(self, main):
+        super().__init__()
+        self.main, self.ch, self.px = main, None, -10
+        self.mode = self.note = self.key = None
+        self.lastlen, self.off = 1.0, 0.0
+        self.selected_notes = []
+        self.selection_start = None
+        self.selection_rect = None
+        self.pending_slur = None
+        self.note_clipboard = []
+        self.fit()
+
+    def fit(self):
+        self.setFixedSize(self.KW + self.main.project.length * self.CW + 1, (P_HI - P_LO + 1) * self.RH)
+
+    def set_channel(self, ch):
+        self.ch = ch
+        self.update()
+
+    def set_play(self, stepf):
+        old = self.px
+        self.px = self.KW + stepf * self.CW if stepf >= 0 else -10
+        for x in (old, self.px):
+            self.update(QRect(int(x) - 2, 0, 6, self.height()))
+
+    def row_pitch(self, y):
+        return int(min(P_HI, max(P_LO, P_HI - int(y // self.RH))))
+
+    def note_at(self, x, y):
+        if not self.ch:
+            return None
+        pitch, sx = self.row_pitch(y), (x - self.KW) / self.CW
+        for n in reversed(self.ch.notes):
+            if int(n[2]) == pitch and n[0] <= sx < n[0] + n[1]:
+                return n
+        return None
+
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        W, H, L, KW, RH = self.width(), self.height(), self.main.project.length, self.KW, self.RH
+        rows = P_HI - P_LO + 1
+        names = "C C# D D# E F F# G G# A A# B".split()
+        for r in range(rows):
+            pitch, y = P_HI - r, r * RH
+            black = pitch % 12 in (1, 3, 6, 8, 10)
+            p.fillRect(QRectF(KW, y, W - KW, RH), QColor("#2b3339" if black else "#353f46"))
+            if pitch % 12 == 0:
+                p.fillRect(QRectF(KW, y + RH - 1, W - KW, 1), QColor("#1c2227"))
+        for i in range(L + 1):
+            col = "#12171a" if i % 16 == 0 else ("#1f262b" if i % 4 == 0 else "#2a3238")
+            p.fillRect(QRectF(KW + i * self.CW, 0, 1, H), QColor(col))
+        for r in range(rows):
+            pitch, y = P_HI - r, r * RH
+            black = pitch % 12 in (1, 3, 6, 8, 10)
+            p.fillRect(QRectF(0, y, KW, RH), QColor("#dfe5e8"))
+            p.fillRect(QRectF(0, y + RH - 1, KW, 1), QColor("#9aa5ab"))
+            if black:
+                p.fillRect(QRectF(0, y, KW * 0.62, RH), QColor("#21282d"))
+            if pitch % 12 == 0:
+                p.setPen(QColor("#333"))
+                p.drawText(QRectF(KW * 0.62, y, KW * 0.38 - 3, RH), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                           f"C{pitch // 12 - 1}")
+        if self.ch:
+            col = QColor(self.ch.color)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            for note in self.ch.notes:
+                st, ln, pi, ve = note[:4]
+                if P_LO <= pi <= P_HI:
+                    x1 = KW + st * self.CW + 1
+                    x2 = KW + (st + ln) * self.CW - 1
+                    ytop = (P_HI - int(pi)) * RH + 1
+                    ybot = ytop + RH - 2
+                    p.setBrush(QColor("#f1c75b") if note in self.selected_notes else col)
+                    p.setPen(QPen(QColor("#fff1b0") if note in self.selected_notes else col.darker(170), 1))
+                    if len(note) > 5 and note[5] is not None:
+                        # The note rectangle itself bends toward the target pitch;
+                        # there is no detached slur line floating outside the note.
+                        target_pitch = int(note[5])
+                        target_top = (P_HI - target_pitch) * RH + 1
+                        target_bottom = target_top + RH - 2
+                        bend_shape = QPainterPath()
+                        bend_shape.moveTo(x1, ytop)
+                        bend_shape.lineTo(x2, target_top)
+                        bend_shape.lineTo(x2, target_bottom)
+                        bend_shape.lineTo(x1, ybot)
+                        bend_shape.closeSubpath()
+                        p.drawPath(bend_shape)
+                    else:
+                        r = QRectF(x1, ytop, max(x2 - x1, 3), RH - 2)
+                        p.drawRoundedRect(r, 2, 2)
+            if self.selection_rect is not None:
+                p.setBrush(QColor(100, 180, 255, 45))
+                p.setPen(QPen(QColor("#80c8ff"), 1, Qt.PenStyle.DashLine))
+                p.drawRect(self.selection_rect.normalized())
+        if self.px >= 0:
+            p.fillRect(QRectF(self.px, 0, 2, H), QColor(255, 255, 255, 170))
+
+    def _note_properties(self, notes, pos=None):
+        """Show a compact context dropdown (never a separate properties window)."""
+        if not notes:
+            return
+        menu = QtWidgets.QMenu(self)
+        if self.ch and self.ch.instrument == "Choir":
+            vowels_menu = menu.addMenu("Set choir vowel")
+            vowels = ["Ah", "Ee", "Oh", "Oo", "Eh"]
+            for vowel_name in vowels:
+                vowels_menu.addAction(vowel_name, lambda v=vowel_name: self._set_note_vowel(notes, v))
+        slur_menu = menu.addMenu("Slur / pitch bend")
+        start_action = slur_menu.addAction("Slur to another note…")
+        clear_action = slur_menu.addAction("Remove slur")
+        start_action.triggered.connect(lambda: self._begin_slur(notes))
+        clear_action.triggered.connect(lambda: self._clear_slurs(notes))
+        if len(notes) > 1:
+            menu.addSeparator()
+            menu.addAction("Copy selected notes", self._copy_selected_notes)
+            menu.addAction("Clear selection", self._clear_selection)
+        menu.exec(self.mapToGlobal(pos if pos is not None else QtCore.QPoint(0, 0)))
+
+    def _set_note_vowel(self, notes, vowel):
+        if not self.ch or self.ch.instrument != "Choir":
+            return
+        for note in notes:
+            while len(note) < 5:
+                note.append(None)
+            note[4] = vowel
+        self.update()
+
+    def _begin_slur(self, notes):
+        if not notes:
+            return
+        self.pending_slur = notes[0]
+        self.main.statusBar().showMessage("Click the destination note with the left mouse button to set the pitch bend.", 6000)
+
+    def _clear_slurs(self, notes):
+        for note in notes:
+            while len(note) < 7:
+                note.append(None)
+            note[5] = None
+            note[6] = None
+        self.update()
+
+    def _copy_selected_notes(self):
+        if not self.selected_notes:
+            return
+        min_start = min(n[0] for n in self.selected_notes)
+        min_pitch = min(n[2] for n in self.selected_notes)
+        self.note_clipboard = [[n[0]-min_start, n[1], n[2]-min_pitch, n[3],
+                                (n[4] if len(n)>4 else None),
+                                ((n[5]-min_pitch) if len(n)>5 and n[5] is not None else None),
+                                ((n[6]-min_start) if len(n)>6 and n[6] is not None else None)]
+                               for n in self.selected_notes]
+        self.main.statusBar().showMessage(f"Copied {len(self.note_clipboard)} notes. Middle-click an empty tile to paste.", 5000)
+
+    def _clear_selection(self):
+        self.selected_notes = []
+        self.update()
+
+    def _group_menu(self, pos):
+        menu = QtWidgets.QMenu(self)
+        if self.ch and self.ch.instrument == "Choir":
+            vowels_menu = menu.addMenu("Set choir vowel for selected notes")
+            for vowel_name in ["Ah", "Ee", "Oh", "Oo", "Eh"]:
+                vowels_menu.addAction(vowel_name, lambda v=vowel_name: self._set_note_vowel(self.selected_notes[:], v))
+        slur_menu = menu.addMenu("Slur / pitch bend")
+        slur_menu.addAction("Slur from first selected note to another…", lambda: self._begin_slur(self.selected_notes[:1]))
+        slur_menu.addAction("Remove slurs", lambda: self._clear_slurs(self.selected_notes[:]))
+        menu.addSeparator()
+        menu.addAction("Copy selected notes", self._copy_selected_notes)
+        menu.addAction("Edit note properties…", lambda: self._note_properties(self.selected_notes[:], pos))
+        menu.addAction("Clear selection", self._clear_selection)
+        menu.exec(self.mapToGlobal(pos))
+
+    def mousePressEvent(self, e):
+        x, y = e.position().x(), e.position().y()
+        if not self.ch:
+            return
+        eng, L = self.main.engine, self.main.project.length
+        n, sx = self.note_at(x, y), (x - self.KW) / self.CW
+        if e.button() == Qt.MouseButton.MiddleButton:
+            if n is not None:
+                if self.selected_notes and n in self.selected_notes:
+                    self._group_menu(e.position().toPoint())
+                elif self.pending_slur is not None and n is not self.pending_slur:
+                    while len(self.pending_slur) < 7: self.pending_slur.append(None)
+                    self.pending_slur[5] = int(n[2])
+                    self.pending_slur[6] = float(n[0])
+                    self.pending_slur = None
+                    self.main.statusBar().showMessage("Slur destination set.", 3000)
+                    self.update()
+                else:
+                    self._note_properties([n], e.position().toPoint())
+            else:
+                # A middle-click starts a marquee; a simple click pastes when a clipboard exists.
+                self.selection_start = (x, y)
+                self.selection_rect = QRectF(x, y, 0, 0)
+                self.selected_notes = []
+                self.update()
+            return
+        if x < self.KW:
+            self.key = self.row_pitch(y)
+            eng.note_on(self.ch, self.key, 0.9)
+            return
+        if e.button() == Qt.MouseButton.RightButton:
+            if n is not None:
+                self.ch.notes.remove(n)
+                if n in self.selected_notes: self.selected_notes.remove(n)
+                self.update(); self.main.rack.refresh_steps()
+            return
+        if n is not None:
+            if self.pending_slur is not None and n is not self.pending_slur:
+                while len(self.pending_slur) < 7: self.pending_slur.append(None)
+                self.pending_slur[5] = int(n[2])
+                self.pending_slur[6] = float(n[0])
+                self.pending_slur = None
+                self.main.statusBar().showMessage("Pitch bend destination set.", 3000)
+                self.update()
+                return
+            self.note = n
+            if sx > n[0] + n[1] - 0.3:
+                self.mode = "resize"
+            else:
+                self.mode, self.off = "move", sx - n[0]
+        else:
+            n = [float(max(0, min(L - 1, int(sx)))), self.lastlen, self.row_pitch(y), 0.9]
+            self.ch.notes.append(n)
+            self.note, self.mode = n, "resize"
+        eng.note_on(self.ch, int(n[2]), 0.9, hold=int(0.25 * SR))
+        self.update(); self.main.rack.refresh_steps()
+
+    def mouseMoveEvent(self, e):
+        if self.selection_start is not None:
+            x, y = e.position().x(), e.position().y()
+            self.selection_rect = QRectF(self.selection_start[0], self.selection_start[1], x-self.selection_start[0], y-self.selection_start[1])
+            self.update()
+            return
+        if not self.note:
+            return
+        x, y, L = e.position().x(), e.position().y(), self.main.project.length
+        sx, n = (x - self.KW) / self.CW, self.note
+        if self.mode == "resize":
+            n[1] = self.lastlen = max(1.0, float(round(sx - n[0])))
+        else:
+            n[0] = float(max(0, min(L - 1, round(sx - self.off))))
+            pitch = self.row_pitch(y)
+            if pitch != n[2]:
+                n[2] = pitch
+                self.main.engine.note_on(self.ch, pitch, 0.9, hold=int(0.2 * SR))
+        self.update(); self.main.rack.refresh_steps()
+
+    def mouseReleaseEvent(self, e):
+        if self.selection_start is not None:
+            rect = self.selection_rect.normalized()
+            dragged = rect.width() > 5 or rect.height() > 5
+            if dragged:
+                self.selected_notes = []
+                for note in self.ch.notes:
+                    nr = QRectF(self.KW + note[0]*self.CW, (P_HI-int(note[2]))*self.RH, max(note[1]*self.CW, 3), self.RH)
+                    if rect.intersects(nr): self.selected_notes.append(note)
+            elif self.note_clipboard:
+                x, y = e.position().x(), e.position().y()
+                base_step, base_pitch = max(0, min(self.main.project.length-1, int((x-self.KW)/self.CW))), self.row_pitch(y)
+                for item in self.note_clipboard:
+                    pasted_pitch = max(P_LO, min(P_HI, base_pitch + item[2]))
+                    copied_vowel = item[4] if len(item)>4 else None
+                    copied_target = (max(P_LO, min(P_HI, base_pitch + item[5])) if len(item)>5 and item[5] is not None else None)
+                    copied_target_step = (base_step + item[6] if len(item)>6 and item[6] is not None else None)
+                    pasted = [base_step + item[0], item[1], pasted_pitch, item[3], copied_vowel, copied_target, copied_target_step]
+                    if pasted[0] < self.main.project.length: self.ch.notes.append(pasted)
+                self.ch.notes.sort(key=lambda a:a[0])
+                self.main.rack.refresh_steps()
+                self.main.statusBar().showMessage("Pasted notes.", 3000)
+            self.selection_start = self.selection_rect = None
+            self.update()
+        if self.key is not None:
+            self.main.engine.note_off(self.ch, self.key)
+        self.key = self.mode = self.note = None
+
+
+class Mixer(QtWidgets.QWidget):
+    def __init__(self, main):
+        super().__init__()
+        self.main, self.ctrl = main, {}
+        self.lay = QtWidgets.QHBoxLayout(self)
+        self.lay.setSpacing(5)
+        self.lay.setContentsMargins(6, 4, 6, 4)
+
+    def sync(self, ch):
+        c = self.ctrl.get(ch)
+        if c:
+            c["vol"].blockSignals(True)
+            c["vol"].setValue(int(ch.vol * 100))
+            c["vol"].blockSignals(False)
+            c["pan"].setValue(ch.pan)
+            c["mute"].blockSignals(True)
+            c["mute"].setChecked(ch.mute)
+            c["mute"].blockSignals(False)
+
+    def rebuild(self):
+        clear(self.lay)
+        self.ctrl = {}
+        for ch in self.main.project.channels:
+            self.lay.addWidget(self.strip(ch))
+        self.lay.addStretch()
+        self.lay.addWidget(self.master())
+
+    def strip(self, ch):
+        f = QtWidgets.QWidget()
+        f.setObjectName("strip")
+        f.setFixedWidth(74)
+        v = QtWidgets.QVBoxLayout(f)
+        v.setContentsMargins(4, 4, 4, 4)
+        v.setSpacing(2)
+        nm = QtWidgets.QLabel(ch.name)
+        nm.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        nm.setStyleSheet(f"background:{ch.color};color:#111;font-weight:bold;border-radius:3px;padding:2px;")
+        v.addWidget(nm)
+        c = {}
+        for label, attr, lo, hi in [("Pan", "pan", -1, 1), ("Cut", "cut", 0, 1), ("Drv", "drive", 0, 1),
+                                    ("Rev", "rev", 0, 1), ("Dly", "dly", 0, 1)]:
+            k = Knob(label, getattr(ch, attr), lo, hi, size=30)
+            k.default = 1.0 if attr == "cut" else (0.0)
+            k.changed.connect(lambda val, a=attr: (setattr(ch, a, val), self.main.sync(ch, from_mixer=True)))
+            v.addWidget(k, alignment=Qt.AlignmentFlag.AlignHCenter)
+            if attr == "pan":
+                c["pan"] = k
+        sl = QtWidgets.QSlider(Qt.Orientation.Vertical)
+        sl.setRange(0, 100)
+        sl.setValue(int(ch.vol * 100))
+        sl.setMinimumHeight(90)
+        sl.valueChanged.connect(lambda val: (setattr(ch, "vol", val / 100), self.main.sync(ch, from_mixer=True)))
+        v.addWidget(sl, 1, alignment=Qt.AlignmentFlag.AlignHCenter)
+        m = QtWidgets.QPushButton("M")
+        m.setCheckable(True)
+        m.setChecked(ch.mute)
+        m.toggled.connect(lambda on: (setattr(ch, "mute", on), self.main.sync(ch, from_mixer=True)))
+        v.addWidget(m)
+        c.update(vol=sl, mute=m)
+        self.ctrl[ch] = c
+        return f
+
+    def master(self):
+        f = QtWidgets.QWidget()
+        f.setObjectName("strip")
+        f.setFixedWidth(80)
+        v = QtWidgets.QVBoxLayout(f)
+        nm = QtWidgets.QLabel("MASTER")
+        nm.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        nm.setStyleSheet(f"background:{ACC};color:#111;font-weight:bold;border-radius:3px;padding:2px;")
+        v.addWidget(nm)
+        sl = QtWidgets.QSlider(Qt.Orientation.Vertical)
+        sl.setRange(0, 100)
+        sl.setValue(int(self.main.project.master * 100))
+        sl.valueChanged.connect(lambda val: (setattr(self.main.project, "master", val / 100), self.main.master_knob.setValue(val / 100)))
+        v.addWidget(sl, 1, alignment=Qt.AlignmentFlag.AlignHCenter)
+        self.master_slider = sl
+        return f
+
+
+class Settings(QtWidgets.QWidget):
+    def __init__(self, main):
+        super().__init__()
+        self.main = main
+        self.setMinimumWidth(240)
+        self.lay = QtWidgets.QVBoxLayout(self)
+
+    def show_channel(self, ch):
+        clear(self.lay)
+        if ch is None:
+            return
+        t = QtWidgets.QLabel(ch.name)
+        t.setStyleSheet(f"font:bold 16px; color:{ch.color};")
+        self.lay.addWidget(t)
+        if ch.kind == "synth":
+            self.lay.addWidget(QtWidgets.QLabel("Instrument / preset"))
+            cb = QtWidgets.QComboBox()
+            cb.addItems(["Synth", "Piano", "Guitar", "Violin", "Choir", "Flute", "Organ", "Bass", "Lead", "Pad"])
+            cb.setCurrentText(ch.instrument)
+            cb.currentTextChanged.connect(lambda name: setattr(ch, "instrument", name))
+            self.lay.addWidget(cb)
+            if ch.instrument == "Choir":
+                self.lay.addWidget(QtWidgets.QLabel("Sung vowel"))
+                vowels = QtWidgets.QComboBox(); vowels.addItems(["Ah", "Ee", "Oh", "Oo", "Eh"]); vowels.setCurrentText(ch.vowel)
+                vowels.currentTextChanged.connect(lambda value: setattr(ch, "vowel", value)); self.lay.addWidget(vowels)
+            self.lay.addWidget(QtWidgets.QLabel("Oscillator"))
+            wave = QtWidgets.QComboBox(); wave.addItems(Channel.WAVES); wave.setCurrentIndex(ch.wave)
+            wave.currentIndexChanged.connect(lambda i: setattr(ch, "wave", i)); self.lay.addWidget(wave)
+            grid = QtWidgets.QGridLayout()
+            for i, (nm, key, lo, hi) in enumerate([("Attack", "a", 0, 1.5), ("Decay", "d", 0, 1.5), ("Sustain", "s", 0, 1),
+                                                   ("Release", "r", 0, 2), ("Detune", "detune", 0, 50)]):
+                k = Knob(nm, getattr(ch, key), lo, hi, size=44)
+                k.changed.connect(lambda v, key=key: setattr(ch, key, v))
+                grid.addWidget(k, i // 3, i % 3)
+            self.lay.addLayout(grid)
+            self.lay.addWidget(QtWidgets.QLabel("Slurs are set per note in the piano roll (middle-click a note)."))
+            hint = QtWidgets.QLabel("Tip: play with your typing keyboard\nor a MIDI keyboard (Options menu).")
+        else:
+            src = ch.path or ("Built-in drum: " + str(ch.builtin))
+            self.lay.addWidget(QtWidgets.QLabel("Sampler\n" + os.path.basename(src) if ch.path else "Sampler\n" + src))
+            b = QtWidgets.QPushButton("Load sample...")
+            b.clicked.connect(lambda: self.main.replace_sample(ch))
+            self.lay.addWidget(b)
+            hint = QtWidgets.QLabel("Notes pitch-shift the sample\n(root note = C4).")
+        hint.setStyleSheet(f"color:{DIM};")
+        self.lay.addWidget(hint)
+        self.lay.addStretch()
+
+
+class Browser(QtWidgets.QTreeView):
+    def __init__(self, main):
+        super().__init__()
+        self.main = main
+        self.fs = QtGui.QFileSystemModel()
+        root = os.path.expanduser("~")
+        self.fs.setRootPath(root)
+        self.fs.setNameFilters(["*" + e for e in AUDIO_EXT + MIDI_EXT + (".pyfl",)])
+        self.fs.setNameFilterDisables(False)
+        self.setModel(self.fs)
+        self.setRootIndex(self.fs.index(root))
+        for c in (1, 2, 3):
+            self.hideColumn(c)
+        self.setHeaderHidden(True)
+        self.setDragEnabled(True)
+        self.setMinimumWidth(200)
+        self.clicked.connect(self.preview)
+        self.doubleClicked.connect(self.open_it)
+
+    def path(self, idx):
+        return self.fs.filePath(idx)
+
+    def preview(self, idx):
+        p = self.path(idx)
+        if p.lower().endswith(AUDIO_EXT) and os.path.isfile(p):
+            try:
+                ch = Channel("preview", "sample", load_sample(p))
+                self.main.engine.note_on(ch, ROOT, 0.9)
+            except Exception:
+                pass
+
+    def open_it(self, idx):
+        p = self.path(idx)
+        if os.path.isfile(p):
+            self.main.handle_files([p])
+
+
+class Dropper(QtCore.QObject):
+    def __init__(self, main):
+        super().__init__(main)
+        self.main = main
+
+    def eventFilter(self, obj, ev):
+        t = ev.type()
+        if t in (QtCore.QEvent.Type.DragEnter, QtCore.QEvent.Type.DragMove) and ev.mimeData().hasUrls():
+            ev.acceptProposedAction()
+            return True
+        if t == QtCore.QEvent.Type.Drop and ev.mimeData().hasUrls():
+            self.main.handle_files([u.toLocalFile() for u in ev.mimeData().urls()])
+            ev.acceptProposedAction()
+            return True
+        return False
+
+
+KEYMAP = {k: i for i, k in enumerate("zsxdcvgbhnjm")}
+KEYMAP.update({k: 12 + i for i, k in enumerate("q2w3er5t6y7ui9o0p")})
+
+
+class Main(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("PyFL Studio")
+        self.resize(1500, 900)
+        self.project = Project()
+        default_project(self.project)
+        self.engine = Engine(self.project)
+        self.audio = Audio(self.engine)
+        self.sel, self.keys_down, self.midi_in, self.file = None, {}, None, None
+
+        self.rack, self.mixer, self.settings = Rack(self), Mixer(self), Settings(self)
+        self.roll = PianoRoll(self)
+        self.roll_scroll = QtWidgets.QScrollArea()
+        self.roll_scroll.setWidget(self.roll)
+        self.setCentralWidget(self.roll_scroll)
+        self.browser = Browser(self)
+        docks = {}
+        for title, w, area in [("Browser", self.browser, Qt.DockWidgetArea.LeftDockWidgetArea),
+                               ("Channel rack", self.rack, Qt.DockWidgetArea.TopDockWidgetArea),
+                               ("Mixer", self.mixer, Qt.DockWidgetArea.BottomDockWidgetArea),
+                               ("Channel settings", self.settings, Qt.DockWidgetArea.RightDockWidgetArea)]:
+            d = QtWidgets.QDockWidget(title, self)
+            d.setWidget(w)
+            d.setFeatures(QtWidgets.QDockWidget.DockWidgetFeature.DockWidgetMovable | QtWidgets.QDockWidget.DockWidgetFeature.DockWidgetFloatable)
+            self.addDockWidget(area, d)
+            docks[title] = d
+        self.docks = docks
+        self.resizeDocks([docks["Channel rack"], docks["Mixer"]], [250, 270], Qt.Orientation.Vertical)
+
+        self.build_toolbar()
+        self.build_menu()
+        self.drop = Dropper(self)
+        for w in (self, self.rack.scroll.viewport(), self.roll_scroll.viewport(), self.mixer):
+            w.setAcceptDrops(True)
+            w.installEventFilter(self.drop)
+        QtGui.QShortcut(QtGui.QKeySequence("Space"), self, activated=self.toggle_play)
+        self.refresh_all()
+        QTimer.singleShot(0, lambda: self.roll_scroll.verticalScrollBar().setValue((P_HI - 76) * PianoRoll.RH))
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.tick)
+        self.timer.start(33)
+
+    # ---- UI construction
+    def build_toolbar(self):
+        tb = self.addToolBar("Transport")
+        tb.setMovable(False)
+        self.play_btn = QtWidgets.QPushButton("▶")
+        self.play_btn.setObjectName("play")
+        self.play_btn.setCheckable(True)
+        self.play_btn.clicked.connect(self.toggle_play)
+        stop = QtWidgets.QPushButton("■")
+        stop.setObjectName("stop")
+        stop.clicked.connect(self.stop)
+        restart = QtWidgets.QPushButton("↺ Restart")
+        restart.setToolTip("Return playback to the beginning")
+        restart.clicked.connect(self.restart)
+        self.playhead = QtWidgets.QSlider(Qt.Orientation.Horizontal)
+        self.playhead.setRange(0, self.project.length * 1000)
+        self.playhead.setMinimumWidth(180)
+        self.playhead.setToolTip("Drag to seek through the song")
+        self.playhead.sliderMoved.connect(self.seek_position)
+        self.playhead.sliderPressed.connect(lambda: setattr(self, "seeking", True))
+        self.playhead.sliderReleased.connect(lambda: setattr(self, "seeking", False))
+        self.seeking = False
+        self.time = QtWidgets.QLabel("001:1:1")
+        self.time.setObjectName("time")
+        self.bpm = QtWidgets.QDoubleSpinBox()
+        self.bpm.setObjectName("bpm")
+        self.bpm.setRange(40, 300)
+        self.bpm.setDecimals(2)
+        self.bpm.setValue(self.project.bpm)
+        self.bpm.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        self.bpm.valueChanged.connect(lambda v: setattr(self.project, "bpm", v))
+        self.bpm.editingFinished.connect(self.bpm.clearFocus)
+        self.len_box = QtWidgets.QComboBox()
+        self.len_box.addItems(["16", "32", "64", "128", "256", "512"])
+        self.len_box.currentTextChanged.connect(self.set_len)
+        self.master_knob = Knob("Master", self.project.master, 0, 1, size=34, show=False)
+        self.master_knob.changed.connect(self.set_master)
+        self.meter = QtWidgets.QProgressBar()
+        self.meter.setRange(0, 100)
+        self.meter.setTextVisible(False)
+        self.meter.setFixedWidth(120)
+        for w in (self.play_btn, stop, restart, self.playhead, self.time, QtWidgets.QLabel("BPM"), self.bpm, QtWidgets.QLabel("Steps"),
+                  self.len_box, QtWidgets.QLabel("Master"), self.master_knob, self.meter):
+            tb.addWidget(w)
+
+    def build_menu(self):
+        mb = self.menuBar()
+        f = mb.addMenu("&File")
+        for item in [("New", self.new_project, "Ctrl+N"), ("Open project...", self.open_project, "Ctrl+O"),
+                     ("Save project...", self.save_project, "Ctrl+S"), None,
+                     ("Import MIDI...", self.import_midi_dialog, None), ("Export MIDI...", self.export_midi_dialog, None),
+                     ("Export WAV...", self.export_wav, None), None, ("Quit", self.close, "Ctrl+Q")]:
+            if item is None:
+                f.addSeparator()
+                continue
+            text, fn, sc = item
+            a = f.addAction(text, fn)
+            if sc:
+                a.setShortcut(sc)
+        a = mb.addMenu("&Add")
+        for instrument in ("Synth", "Piano", "Guitar", "Violin", "Choir", "Flute", "Organ", "Bass", "Lead", "Pad"):
+            a.addAction(instrument, lambda checked=False, inst=instrument: self.add_instrument(inst))
+        a.addAction("Audio file...", self.add_sample_dialog)
+        a.addAction("Record hum notes...", self.record_hum_notes)
+        self.midi_menu = mb.addMenu("&Options").addMenu("MIDI input")
+        self.midi_menu.aboutToShow.connect(self.fill_midi_menu)
+        v = mb.addMenu("&View")
+        for d in self.docks.values():
+            v.addAction(d.toggleViewAction())
+
+    # ---- state / refresh
+    def refresh_all(self):
+        keep = self.sel if self.sel in self.project.channels else None
+        self.rack.rebuild()
+        self.mixer.rebuild()
+        self.bpm.blockSignals(True)
+        self.bpm.setValue(self.project.bpm)
+        self.bpm.blockSignals(False)
+        self.len_box.blockSignals(True)
+        self.len_box.setCurrentText(str(self.project.length) if str(self.project.length) in
+                                    [self.len_box.itemText(i) for i in range(self.len_box.count())] else "512")
+        self.len_box.blockSignals(False)
+        self.master_knob.setValue(self.project.master)
+        self.playhead.setRange(0, self.project.length * 1000)
+        for r in self.rack.rows:
+            r.steps.fit()
+        self.roll.fit()
+        self.select_channel(keep or (self.project.channels[0] if self.project.channels else None))
+        self.rack.inner.adjustSize()
+
+    def select_channel(self, ch):
+        if ch is self.sel and self.roll.ch is ch:
+            return
+        self.sel = ch
+        for r in self.rack.rows:
+            r.btn.setChecked(r.ch is ch)
+        self.roll.set_channel(ch)
+        self.settings.show_channel(ch)
+
+    def sync(self, ch, from_mixer=False):
+        for r in self.rack.rows:
+            if r.ch is ch:
+                r.pank.setValue(ch.pan)
+                r.volk.setValue(ch.vol)
+                r.led.blockSignals(True)
+                r.led.setChecked(not ch.mute)
+                r.led.blockSignals(False)
+        if not from_mixer:
+            self.mixer.sync(ch)
+
+    def set_len(self, text):
+        self.project.length = int(text)
+        for r in self.rack.rows:
+            r.steps.fit()
+            r.steps.update()
+        self.roll.fit()
+        self.roll.update()
+
+    def set_master(self, v):
+        self.project.master = v
+        if hasattr(self.mixer, "master_slider"):
+            self.mixer.master_slider.blockSignals(True)
+            self.mixer.master_slider.setValue(int(v * 100))
+            self.mixer.master_slider.blockSignals(False)
+
+    # ---- transport
+    def toggle_play(self):
+        if self.engine.playing:
+            self.engine.stop(reset=False)
+        else:
+            self.engine.playing = True
+        self.play_btn.setChecked(self.engine.playing)
+
+    def stop(self):
+        self.engine.stop()
+        self.play_btn.setChecked(False)
+
+    def restart(self):
+        was_playing = self.engine.playing
+        self.engine.stop(reset=True)
+        if was_playing: self.engine.playing = True
+        self.play_btn.setChecked(self.engine.playing)
+        self.playhead.setValue(0)
+
+    def seek_position(self, value):
+        ss = 60.0 / self.project.bpm / 4 * SR
+        with self.engine.lock:
+            self.engine.pos = int((value / 1000.0) * ss)
+
+    def record_hum_notes(self):
+        if sd is None:
+            return self.err("Microphone recording needs sounddevice. Run ./install.sh first.")
+        if self.sel is None or self.sel.kind != "synth":
+            return self.err("Select a synth/instrument channel first.")
+        seconds, ok = QtWidgets.QInputDialog.getDouble(self, "Hum notes", "Recording length in seconds:", 8.0, 1.0, 60.0, 1)
+        if not ok: return
+        try:
+            self.statusBar().showMessage("Recording microphone… hum one note at a time", int(seconds*1000))
+            QtWidgets.QApplication.processEvents()
+            audio = sd.rec(int(seconds*SR), samplerate=SR, channels=1, dtype="float32")
+            sd.wait()
+            mono = audio[:, 0]
+            frame, hop = 4096, 1024
+            detected = []
+            for start in range(0, max(1, len(mono)-frame), hop):
+                x = mono[start:start+frame]
+                if len(x) < frame: break
+                x = x - x.mean()
+                rms = float(np.sqrt(np.mean(x*x)))
+                if rms < 0.012: detected.append(None); continue
+                corr = np.fft.irfft(np.abs(np.fft.rfft(x, n=frame*2))**2)[:frame]
+                lo, hi = int(SR/1000), min(len(corr)-1, int(SR/65))
+                if hi <= lo: detected.append(None); continue
+                lag = lo + int(np.argmax(corr[lo:hi]))
+                hz = SR / lag
+                if not 65 <= hz <= 1000: detected.append(None); continue
+                pitch = int(round(69 + 12*math.log2(hz/440)))
+                detected.append(pitch)
+            step_seconds = 60.0 / self.project.bpm / 4
+            notes, active, begin = [], None, 0
+            for i, pitch in enumerate(detected + [None]):
+                if pitch != active:
+                    if active is not None:
+                        st = begin * hop / SR / step_seconds
+                        en = i * hop / SR / step_seconds
+                        if en-st >= 0.18/step_seconds:
+                            notes.append([float(st), max(0.25, float(en-st)), active, 0.85])
+                    active, begin = pitch, i
+            if not notes: return self.err("No clear pitched notes detected. Try a quieter room and hum one note at a time.")
+            self.sel.notes.extend(notes)
+            self.sel.notes.sort(key=lambda n:n[0])
+            self.refresh_all()
+            self.statusBar().showMessage(f"Transcribed {len(notes)} notes into {self.sel.name}", 5000)
+        except Exception as ex:
+            self.err(f"Microphone recording failed: {ex}")
+
+    def tick(self):
+        e = self.engine
+        ss = 60.0 / self.project.bpm / 4 * SR
+        show = e.playing or e.pos > 0
+        stepf = e.pos / ss if show else -1
+        for r in self.rack.rows:
+            r.steps.set_play(int(stepf) if show else -1)
+        self.roll.set_play(stepf)
+        s = int(max(stepf, 0))
+        self.time.setText(f"{s // 16 + 1:03d}:{(s % 16) // 4 + 1}:{s % 4 + 1}")
+        if not self.seeking:
+            self.playhead.blockSignals(True)
+            self.playhead.setValue(int(max(0, min(self.project.length, stepf)) * 1000))
+            self.playhead.blockSignals(False)
+        self.meter.setValue(int(min(1.0, e.peak) * 100))
+        self.play_btn.setChecked(e.playing)
+
+    # ---- file operations
+    def err(self, msg):
+        QtWidgets.QMessageBox.warning(self, "PyFL Studio", str(msg))
+
+    def handle_files(self, paths):
+        for p in paths:
+            low = p.lower()
+            try:
+                if low.endswith(AUDIO_EXT):
+                    self.select_channel(self.project.add_sample(p))
+                elif low.endswith(MIDI_EXT):
+                    self.do_import_midi(p)
+                elif low.endswith(".pyfl"):
+                    self.do_open(p)
+            except Exception as ex:
+                self.err(f"Could not load {os.path.basename(p)}:\n{ex}")
+        self.refresh_all()
+
+    def add_synth(self):
+        self.add_instrument("Synth")
+
+    def add_instrument(self, instrument):
+        ch = self.project.add_synth(instrument)
+        ch.instrument = instrument
+        if instrument == "Piano": ch.a, ch.d, ch.s, ch.r, ch.detune = 0.003, 0.8, 0.15, 0.35, 0
+        elif instrument == "Guitar": ch.a, ch.d, ch.s, ch.r, ch.detune = 0.005, 0.5, 0.25, 0.25, 0
+        elif instrument == "Violin": ch.a, ch.d, ch.s, ch.r = 0.18, 0.25, 0.85, 0.4
+        elif instrument == "Choir": ch.a, ch.d, ch.s, ch.r = 0.12, 0.25, 0.9, 0.5
+        elif instrument in ("Pad",): ch.a, ch.d, ch.s, ch.r = 0.45, 0.5, 0.8, 1.0
+        self.select_channel(ch)
+        self.refresh_all()
+
+    def add_sample_dialog(self):
+        ps, _ = QtWidgets.QFileDialog.getOpenFileNames(self, "Add sample", "", "Audio (*.wav *.mp3 *.flac *.ogg *.aif *.aiff)")
+        if ps:
+            self.handle_files(ps)
+
+    def replace_sample(self, ch):
+        p, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load sample", "", "Audio (*.wav *.mp3 *.flac *.ogg *.aif *.aiff)")
+        if p:
+            try:
+                ch.sample, ch.path, ch.builtin = load_sample(p), p, None
+                self.settings.show_channel(ch)
+            except Exception as ex:
+                self.err(ex)
+
+    def do_import_midi(self, p):
+        if mido is None:
+            return self.err("Install mido:  pip install mido python-rtmidi")
+        n = import_midi(p, self.project)
+        if not n:
+            self.err("No melodic notes found in that MIDI file.")
+
+    def import_midi_dialog(self):
+        p, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Import MIDI", "", "MIDI (*.mid *.midi)")
+        if p:
+            self.handle_files([p])
+
+    def export_midi_dialog(self):
+        if mido is None:
+            return self.err("Install mido:  pip install mido")
+        p, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export MIDI", "song.mid", "MIDI (*.mid)")
+        if p:
+            export_midi(p, self.project)
+
+    def export_wav(self):
+        p, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export WAV", "song.wav", "WAV (*.wav)")
+        if not p:
+            return
+        self.stop()
+        QtWidgets.QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            audio = Engine(self.project).render_offline()
+            wavfile.write(p, SR, (np.clip(audio.T, -1, 1) * 32767).astype(np.int16))
+        except Exception as ex:
+            self.err(ex)
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+
+    def new_project(self):
+        self.stop()
+        self.project.channels.clear()
+        self.project.bpm, self.project.length = 130.0, 32
+        self.sel = None
+        self.refresh_all()
+
+    def save_project(self):
+        p, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save project", self.file or "project.pyfl", "PyFL project (*.pyfl)")
+        if p:
+            with open(p, "w") as fh:
+                json.dump(self.project.to_json(), fh)
+            self.file = p
+
+    def do_open(self, p):
+        self.stop()
+        with open(p) as fh:
+            self.project.load_json(json.load(fh))
+        self.file, self.sel = p, None
+
+    def open_project(self):
+        p, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open project", "", "PyFL project (*.pyfl)")
+        if p:
+            self.handle_files([p])
+
+    # ---- MIDI keyboard + typing keyboard
+    def fill_midi_menu(self):
+        self.midi_menu.clear()
+        if mido is None:
+            self.midi_menu.addAction("mido not installed").setEnabled(False)
+            return
+        try:
+            names = mido.get_input_names()
+        except Exception:
+            names = []
+        if not names:
+            self.midi_menu.addAction("No MIDI inputs found").setEnabled(False)
+        for n in names:
+            a = self.midi_menu.addAction(n)
+            a.setCheckable(True)
+            a.setChecked(self.midi_in is not None and self.midi_in.name == n)
+            a.triggered.connect(lambda _=False, n=n: self.open_midi(n))
+
+    def open_midi(self, name):
+        try:
+            if self.midi_in:
+                self.midi_in.close()
+            self.midi_in = mido.open_input(name, callback=self.on_midi)
+        except Exception as ex:
+            self.err(f"Could not open MIDI input:\n{ex}")
+
+    def on_midi(self, msg):
+        ch = self.sel
+        if ch is None:
+            return
+        if msg.type == "note_on" and msg.velocity > 0:
+            self.engine.note_on(ch, msg.note, msg.velocity / 127.0)
+        elif msg.type in ("note_off", "note_on"):
+            self.engine.note_off(ch, msg.note)
+
+    def keyPressEvent(self, e):
+        k = e.text().lower()
+        if k in KEYMAP and not e.isAutoRepeat() and self.sel and not (e.modifiers() & Qt.KeyboardModifier.ControlModifier):
+            pitch = 60 + KEYMAP[k]
+            if k not in self.keys_down:
+                self.keys_down[k] = (self.sel, pitch)
+                self.engine.note_on(self.sel, pitch, 0.9)
+            return
+        super().keyPressEvent(e)
+
+    def keyReleaseEvent(self, e):
+        k = e.text().lower()
+        if k in self.keys_down and not e.isAutoRepeat():
+            ch, pitch = self.keys_down.pop(k)
+            self.engine.note_off(ch, pitch)
+            return
+        super().keyReleaseEvent(e)
+
+    def closeEvent(self, e):
+        self.timer.stop()
+        if self.midi_in:
+            self.midi_in.close()
+        self.audio.close()
+        super().closeEvent(e)
+
+
+def main():
+    app = QtWidgets.QApplication(sys.argv)
+    app.setStyle("Fusion")
+    app.setStyleSheet(QSS)
+    w = Main()
+    w.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

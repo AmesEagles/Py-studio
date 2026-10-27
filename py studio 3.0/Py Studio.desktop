@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Py Studio
+Comment=Python Music Studio
+Exec=bash "/home/brickedeagle/pyfl studio 3.0/run.sh"
+Path=/home/brickedeagle/pyfl studio 3.0
+Terminal=false
+StartupNotify=true
+StartupWMClass=pyfl_studio.py
+Categories=AudioVideo;Audio;
+Icon=/home/brickedeagle/pyfl studio 3.0/pyfl.png
+
